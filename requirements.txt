@@ -1,4 +1,4 @@
-streamlit>=1.38
+streamlit>=1.40
 feedparser>=6.0
 requests>=2.31
 beautifulsoup4>=4.12

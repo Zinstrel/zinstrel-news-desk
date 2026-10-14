@@ -20,12 +20,35 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
+from pathlib import Path
+from urllib.parse import urljoin
+
 import feedparser
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="Zinstrel News Desk", page_icon="📡", layout="wide")
+HERE = Path(__file__).parent
+LOGO_PATH = HERE / "zinstrel-logo.png"
+STAR_PATH = HERE / "zinstrel-star.png"
+
+
+def _page_icon():
+    try:
+        from PIL import Image
+        return Image.open(STAR_PATH)
+    except Exception:
+        return "✦"
+
+
+st.set_page_config(page_title="Zinstrel News Desk", page_icon=_page_icon(), layout="wide")
+
+
+def show_logo(width=300):
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=width)
+    else:
+        st.title("Zinstrel")
 
 
 def get_secret(name, default=""):
@@ -44,17 +67,20 @@ APP_PASSWORD = get_secret("APP_PASSWORD")
 def _password_ok():
     if st.session_state.get("authed"):
         return True
-    st.title("📡 Zinstrel News Desk")
-    if not APP_PASSWORD:
-        st.error("APP_PASSWORD isn't set in this app's secrets, so the desk is locked.")
-        return False
-    pw = st.text_input("Password", type="password")
-    if pw:
-        if hmac.compare_digest(pw, APP_PASSWORD):
-            st.session_state["authed"] = True
-            st.rerun()
-        else:
-            st.error("Wrong password.")
+    col, _ = st.columns([1, 1.6])
+    with col:
+        show_logo(260)
+        st.subheader("News Desk")
+        if not APP_PASSWORD:
+            st.error("APP_PASSWORD isn't set in this app's secrets, so the desk is locked.")
+            return False
+        pw = st.text_input("Password", type="password")
+        if pw:
+            if hmac.compare_digest(pw, APP_PASSWORD):
+                st.session_state["authed"] = True
+                st.rerun()
+            else:
+                st.error("Wrong password.")
     return False
 
 
@@ -128,7 +154,16 @@ TRADE_SITES = [
     "completemusicupdate.com", "musically.com", "hypebot.com", "theverge.com",
     "musicweek.com", "variety.com",
 ]
-ALL_BEATS = list(BEATS) + [TRADES_TAB]
+
+# Newsletters read directly from their own sites (not through Google News).
+NEWSLETTERS_TAB = "Newsletters"
+NEWSLETTERS = [
+    {"name": "The AI Musicpreneur", "site": "https://the-ai-musicpreneur.beehiiv.com"},
+    {"name": "AI Music Newsletter", "site": "https://aimusicnewsletter.substack.com"},
+]
+NEWSLETTER_MIN_DAYS = 7   # weekly-ish newsletters: always look back at least this far
+
+ALL_BEATS = list(BEATS) + [TRADES_TAB, NEWSLETTERS_TAB]
 
 FORMATS = {
     "Major Signal": {
@@ -163,8 +198,17 @@ HOUSE_RULES = """ZINSTREL HOUSE STYLE (follow all of these):
 - Plain, reader-friendly, confident. Short declarative headlines work best; avoid long titles, multi-noun "And" headlines, front-loaded jargon, and brand-heavy openings.
 - Quotes: use full direct quotes rather than paraphrase or partial quotes, but ONLY quotes that appear verbatim in the source material. Never invent, alter, or attribute a quote that is not in the source.
 - Facts: use only facts supported by the source material. If something important is unknown, say it is unconfirmed rather than guessing. Never invent numbers, dates, names, or details.
-- Links: link to primary sources (the organization's own announcement or page) rather than other news outlets where possible. Use markdown links. Only use URLs that appear in the source material or the SOURCE LINK.
+- Links: link to primary sources (the organization's own announcement or page) rather than other news outlets. Use markdown links. Only use URLs that appear in the lead material or that you actually found through search or fetch.
 - Don't add format labels such as "MAJOR SIGNAL" to the headline or body."""
+
+ORIGINAL_REPORTING = """ORIGINAL REPORTING (this matters most):
+- The lead item is a tip, not the story. When it is another outlet's or newsletter's reporting, do NOT rewrite it, and do NOT build the piece on "according to [outlet]" or "[outlet] reported."
+- Before writing, use web search and web fetch to go to the primary material: the company's or person's own announcement, press release, blog post, filing, court document, bill text, official social post, dataset, product page, or original statement. Read it.
+- Write the story from that primary material, link to it, and check every key fact (names, numbers, dates, terms) against it. If the primary material contradicts the lead, follow the primary material and flag the discrepancy.
+- Quotes: use only quotes that appear in primary material you found, and link to where they appear. If a quote exists only in another outlet's interview, leave it out; if it's essential, attribute it explicitly ("told Billboard") and list it under follow-ups as a quote to replace with Zinstrel's own.
+- Credit an outlet only when its own reporting is the sole source of a material fact (an exclusive). Say so plainly and flag it.
+- If you cannot find primary material for a claim, either drop the claim or mark it as unconfirmed. Never present secondhand claims as established fact.
+- Add Zinstrel's value: context from the wider AI music landscape that the lead didn't include, only if you can verify it."""
 
 
 # ============================================================
@@ -246,7 +290,8 @@ WIRE_LIST_FIELDS = ["Headline", "Summary", "Status", "Beat", "Outlet", "URL",
 
 @st.cache_data(ttl=120, show_spinner=False)
 def load_wire(status):
-    fields = WIRE_LIST_FIELDS + (["Article Text", "Editor's Note"] if status == "Queued" else [])
+    extra = {"Queued": ["Article Text", "Editor's Note"], "Drafted": ["Draft Notes"]}.get(status, [])
+    fields = WIRE_LIST_FIELDS + extra
     if status == "New":
         formula = "OR({Status}='New',{Status}='')"
     else:
@@ -329,6 +374,82 @@ def fetch_headlines(beats, days_back, include_trades):
     return out
 
 
+def _html_to_text(html):
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+        tag.decompose()
+    root = soup.find("article") or soup
+    paras = [p.get_text(" ", strip=True) for p in root.find_all(["p", "li", "h2", "h3"])]
+    return "\n\n".join(p for p in paras if len(p) > 30)
+
+
+def _meta(soup, *names):
+    for n in names:
+        tag = soup.find("meta", attrs={"property": n}) or soup.find("meta", attrs={"name": n})
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    return ""
+
+
+def _parse_iso(s):
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _fetch_post_page(url, outlet):
+    """Reads one newsletter post page: title, date, full text."""
+    try:
+        r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=15)
+        if r.status_code != 200:
+            return None
+    except Exception:
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+    title = _meta(soup, "og:title", "twitter:title") or (soup.title.get_text(strip=True) if soup.title else "")
+    published = _parse_iso(_meta(soup, "article:published_time", "og:article:published_time"))
+    if not published:
+        t = soup.find("time", attrs={"datetime": True})
+        published = _parse_iso(t["datetime"]) if t else None
+    return {"title": title.strip(), "link": url, "url": url, "outlet": outlet, "published": published,
+            "keyword": outlet, "text": _html_to_text(r.text) or None, "beat": NEWSLETTERS_TAB}
+
+
+def fetch_newsletter(src, days_back):
+    """RSS first (Substack has one at /feed); otherwise read the archive page (beehiiv)."""
+    days = max(days_back, NEWSLETTER_MIN_DAYS)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    name, site = src["name"], src["site"].rstrip("/")
+    posts = []
+    try:
+        r = requests.get(f"{site}/feed", headers={"User-Agent": BROWSER_UA}, timeout=12)
+        feed = feedparser.parse(r.content) if r.status_code == 200 else None
+    except Exception:
+        feed = None
+    if feed and feed.entries:
+        for e in feed.entries[:15]:
+            html = (e.get("content") or [{}])[0].get("value") or e.get("summary", "")
+            posts.append({"title": e.get("title", "").strip(), "link": e.get("link", ""),
+                          "url": e.get("link", ""), "outlet": name, "published": _parse_date(e),
+                          "keyword": name, "text": _html_to_text(html) or None, "beat": NEWSLETTERS_TAB})
+    else:
+        try:
+            r = requests.get(f"{site}/archive?page=1", headers={"User-Agent": BROWSER_UA}, timeout=12)
+            soup = BeautifulSoup(r.text, "html.parser") if r.status_code == 200 else None
+        except Exception:
+            soup = None
+        links = []
+        for a in (soup.find_all("a", href=True) if soup else []):
+            href = urljoin(site + "/", a["href"]).split("?")[0].split("#")[0]
+            if "/p/" in href and href.startswith(site) and href not in links:
+                links.append(href)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            posts = [p for p in pool.map(lambda u: _fetch_post_page(u, name), links[:8]) if p]
+    return [p for p in posts if p["title"] and (not p["published"] or p["published"] >= cutoff)]
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def _decode_google_news(url):
     # Raises on failure so only successful lookups get cached.
@@ -356,12 +477,7 @@ def get_article_text(url):
     try:
         r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=15, allow_redirects=True)
         if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
-                tag.decompose()
-            root = soup.find("article") or soup
-            paras = [p.get_text(" ", strip=True) for p in root.find_all("p")]
-            text = "\n\n".join(p for p in paras if len(p) > 40)
+            text = _html_to_text(r.text)
             if len(text) > 600:
                 return text
     except Exception:
@@ -421,39 +537,103 @@ def word_count(text):
     return len(re.findall(r"\b[\w'’-]+\b", body))
 
 
+def research_tools(fmt):
+    searches = 3 if fmt == "Minor Signal" else 5
+    return [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": searches},
+        {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 4, "max_content_tokens": 12000},
+    ]
+
+
+def claude_with_research(system, user, tools, max_tokens=8000):
+    """Runs a turn that may search and fetch. Returns (all_text, was_cut_off, searches_used).
+    Falls back to no tools if web search/fetch isn't enabled on the API account."""
+    from anthropic import Anthropic
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    messages = [{"role": "user", "content": user}]
+    texts, searches = [], 0
+    for _ in range(6):  # the API can pause long research turns; resume them
+        try:
+            resp = client.messages.create(model=DRAFT_MODEL, max_tokens=max_tokens, system=system,
+                                          messages=messages, **({"tools": tools} if tools else {}))
+        except Exception as e:
+            if tools and any(w in str(e).lower() for w in ("web_search", "web search", "web_fetch", "tool")):
+                return None  # caller retries without research
+            raise
+        texts.extend(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        usage = getattr(getattr(resp, "usage", None), "server_tool_use", None)
+        searches += getattr(usage, "web_search_requests", 0) or 0
+        if getattr(resp, "stop_reason", "") == "pause_turn":
+            messages.append({"role": "assistant", "content": resp.content})
+            continue
+        return "".join(texts), getattr(resp, "stop_reason", "") == "max_tokens", searches
+    return "".join(texts), True, searches
+
+
+def _section(text, label, stop_labels):
+    m = re.search(rf"{label}:\s*(.*?)(?=(?:{'|'.join(stop_labels)}):|\Z)", text, flags=re.S | re.I)
+    return m.group(1).strip() if m else ""
+
+
 def draft_article(rec_fields, fmt, note, source_text):
-    """Returns dict: headline, body, flags, words, cut_off."""
-    system = ("You are a senior writer at Zinstrel drafting a first version for the editor, "
-              "Marcus Lawrence, to revise.\n\n" + HOUSE_RULES)
+    """Researches primary sources, then writes. Returns dict with headline, body, notes, words,
+    cut_off, researched."""
+    system = ("You are a senior reporter at Zinstrel writing a first draft for the editor, Marcus "
+              "Lawrence, to revise.\n\n" + HOUSE_RULES + "\n\n" + ORIGINAL_REPORTING)
     user = f"""FORMAT: {fmt}
 FORMAT GUIDANCE: {FORMATS[fmt]['guide']}
 EDITOR'S NOTE: {note or '(none)'}
 
-SOURCE HEADLINE: {rec_fields.get('Headline', '')}
-SOURCE OUTLET: {rec_fields.get('Outlet') or 'unknown'}
-SOURCE LINK: {rec_fields.get('URL', '')}
+LEAD ITEM (a tip to report out, not a source to rewrite)
+HEADLINE: {rec_fields.get('Headline', '')}
+OUTLET: {rec_fields.get('Outlet') or 'unknown'}
+LINK: {rec_fields.get('URL', '')}
 
-SOURCE MATERIAL:
-{source_text[:30000]}
+LEAD TEXT:
+{source_text[:25000]}
 
-Return exactly this shape:
+First, research: find and read the primary material behind this lead. Then write.
+When you're done researching, output the finished piece in exactly this shape and nothing after it:
+
 HEADLINE: <headline>
-<blank line>
+
 <body in markdown prose>
 ---
-EDITOR FLAGS: <one short paragraph: anything unconfirmed, claims that need a primary-source link, quotes you could not verify. Write "None." if nothing.>"""
-    raw, cut_off = claude(DRAFT_MODEL, system, user, 5000)
-    text = raw.strip()
+EDITOR FLAGS: <anything unconfirmed, discrepancies between the lead and primary sources, quotes you could not verify. "None." if nothing.>
+FOLLOW-UP REPORTING: <1-3 people or organizations Zinstrel should contact for its own comment, and the question to ask each.>
+PRIMARY SOURCES: <the primary-source URLs you used, one per line. "None found." if none.>"""
+    result = claude_with_research(system, user, research_tools(fmt))
+    researched = result is not None
+    if not researched:
+        user = user.replace("First, research: find and read the primary material behind this lead. Then write.",
+                            "Web research is unavailable, so write from the lead text, keep claims attributed, "
+                            "and list what needs primary-source checking under EDITOR FLAGS.")
+        result = claude_with_research(system, user, None)
+    raw, cut_off, searches = result
+
+    # The finished piece starts at the last HEADLINE: (earlier text is research narration).
+    starts = list(re.finditer(r"^[ \t#*]*HEADLINE:", raw, flags=re.M))
+    text = raw[starts[-1].start():] if starts else raw
     headline = rec_fields.get("Headline", "")
     m = re.match(r"^\s*HEADLINE:\s*(.+?)\s*\n", text, flags=re.IGNORECASE)
     if m:
         headline = m.group(1).strip().strip('"*# ')
         text = text[m.end():].strip()
-    body, _, flags = text.partition("\n---")
-    flags = re.sub(r"^\s*EDITOR FLAGS:\s*", "", flags.strip(), flags=re.IGNORECASE)
+    body, _, tail = text.partition("\n---")
+    stops = ["EDITOR FLAGS", "FOLLOW-UP REPORTING", "PRIMARY SOURCES"]
+    flags = _section(tail, "EDITOR FLAGS", stops) or "None."
+    follow = _section(tail, "FOLLOW-UP REPORTING", stops)
+    sources = _section(tail, "PRIMARY SOURCES", stops)
+    if not researched:
+        flags = "⚠️ Web research was unavailable, so this was written from the lead only. " + flags
+    notes = f"Editor flags: {flags}"
+    if follow:
+        notes += f"\n\nFollow-up reporting: {follow}"
+    if sources:
+        notes += f"\n\nPrimary sources:\n{sources}"
     body = body.strip()
-    return {"headline": headline, "body": body, "flags": flags or "None.",
-            "words": word_count(body), "cut_off": cut_off}
+    return {"headline": headline, "body": body, "notes": notes, "words": word_count(body),
+            "cut_off": cut_off, "researched": researched, "searches": searches}
 
 
 # ============================================================
@@ -481,7 +661,7 @@ def send_to_lovable(draft, fmt, rec_fields):
 
 
 def send_to_stories(draft, fmt, rec_fields, note):
-    article = f"{draft['body']}\n\n---\nEditor flags: {draft['flags']}\n\nWord count: {draft['words']}"
+    article = f"{draft['body']}\n\n---\n{draft['notes']}\n\nWord count: {draft['words']}"
     notes = "\n".join(x for x in [
         f"Editor's note: {note}" if note else "",
         f"Drafted by news desk as {fmt} · {draft['words']} words",
@@ -503,9 +683,13 @@ def send_to_stories(draft, fmt, rec_fields, note):
 # ============================================================
 # SCAN
 # ============================================================
-def run_scan(beats, days_back, include_trades, max_new, progress):
-    progress(0.02, "Searching Google News…")
-    found = fetch_headlines(beats, days_back, include_trades)
+def run_scan(beats, days_back, include_trades, max_new, progress, include_newsletters=True):
+    progress(0.02, "Searching Google News and newsletters…")
+    found = fetch_headlines(beats, days_back, include_trades) if (beats or include_trades) else []
+    if include_newsletters:
+        with ThreadPoolExecutor(max_workers=len(NEWSLETTERS)) as pool:
+            for posts in pool.map(lambda s: fetch_newsletter(s, days_back), NEWSLETTERS):
+                found.extend(posts)
 
     progress(0.10, "Checking what's already on the wire…")
     existing = at_list(WIRE_TABLE, fields=["Google Link", "Headline", "URL"])
@@ -522,20 +706,22 @@ def run_scan(beats, days_back, include_trades, max_new, progress):
         removed = cleanup_wire()
         return {"found": len(found), "added": 0, "capped": 0, "removed": removed}
 
-    n = len(fresh)
+    to_decode = [a for a in fresh if not a.get("url")]  # newsletters already have their own link
+    n = len(to_decode)
     with ThreadPoolExecutor(max_workers=4) as pool:  # gentle on Google
-        futs = {pool.submit(resolve_publisher_url, a["link"]): a for a in fresh}
+        futs = {pool.submit(resolve_publisher_url, a["link"]): a for a in to_decode}
         for k, fut in enumerate(as_completed(futs), 1):
             futs[fut]["url"] = fut.result()
             progress(0.10 + 0.30 * k / n, f"Finding original articles… {k}/{n}")
 
     fresh = [a for a in fresh if a["url"] not in seen]  # publisher URL already on the wire
     n = len(fresh)
+    to_read = [a for a in fresh if not a.get("text")]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(get_article_text, a["url"]): a for a in fresh}
+        futs = {pool.submit(get_article_text, a["url"]): a for a in to_read}
         for k, fut in enumerate(as_completed(futs), 1):
             futs[fut]["text"] = fut.result()
-            progress(0.40 + 0.30 * k / max(n, 1), f"Reading articles… {k}/{n}")
+            progress(0.40 + 0.30 * k / max(len(to_read), 1), f"Reading articles… {k}/{len(to_read)}")
 
     batches = [fresh[i:i + 8] for i in range(0, n, 8)]
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -609,21 +795,25 @@ def set_status_one(rec_id, status):
 # ============================================================
 # STYLE
 # ============================================================
+# Light theme so the logo's full gradient reads (the deep purple/navy middle disappears on dark).
+# Colors are pulled from the logo: magenta → plum → navy → sky blue.
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-h1, h2, h3 { font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -0.01em; }
-.zn-card { border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 11px 14px;
-           margin-bottom: 4px; background: rgba(255,255,255,0.02); }
-.zn-card.sel { border-color: #FF3DA5; box-shadow: 0 0 0 1px #FF3DA5 inset; }
-.zn-title a { color: inherit; text-decoration: none; font-weight: 600; font-size: 1.02rem; }
-.zn-title a:hover { color: #3DE0FF; }
-.zn-sum { font-size: 0.92rem; opacity: 0.85; margin-top: 4px; }
-.zn-meta { font-size: 0.78rem; opacity: 0.6; margin-top: 5px; }
-.zn-tag { display: inline-block; font-size: 0.7rem; padding: 1px 7px; border-radius: 99px;
-          background: rgba(61,224,255,0.12); color: #3DE0FF; margin-left: 6px; }
-.zn-warn { background: rgba(255,200,61,0.15); color: #FFC83D; }
+h1, h2, h3 { font-family: 'Space Grotesk', sans-serif !important; letter-spacing: -0.01em; color: #1E1747; }
+.zn-bar { height: 4px; border-radius: 4px; margin: 2px 0 14px;
+          background: linear-gradient(90deg, #FF00E6, #8E0F8F 40%, #1E2A5E 65%, #0A9BFF); }
+.zn-card { border: 1px solid #E6E1F2; border-radius: 12px; padding: 12px 15px; margin-bottom: 4px;
+           background: #FFFFFF; box-shadow: 0 1px 2px rgba(30,23,71,0.04); }
+.zn-card.sel { border-color: #E000CC; box-shadow: 0 0 0 1px #E000CC inset; }
+.zn-title a { color: #1E1747; text-decoration: none; font-weight: 600; font-size: 1.02rem; }
+.zn-title a:hover { color: #0A7FD6; }
+.zn-sum { font-size: 0.93rem; color: #3D3666; margin-top: 4px; }
+.zn-meta { font-size: 0.78rem; color: #7A7499; margin-top: 6px; }
+.zn-tag { display: inline-block; font-size: 0.7rem; padding: 1px 8px; border-radius: 99px;
+          background: #E8F4FF; color: #0566B8; margin-left: 6px; }
+.zn-warn { background: #FFF3DC; color: #8A5300; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -659,7 +849,17 @@ def card(f, selected=False, extra_tags=""):
 # ============================================================
 # PAGE
 # ============================================================
-st.title("📡 Zinstrel News Desk")
+try:
+    st.logo(str(LOGO_PATH), icon_image=str(STAR_PATH), size="large")
+except Exception:
+    pass
+h1, h2 = st.columns([1, 2.4])
+with h1:
+    show_logo(240)
+with h2:
+    st.markdown("<div style='padding-top:14px;font-family:Space Grotesk,sans-serif;font-size:1.5rem;"
+                "font-weight:700;color:#1E1747'>News Desk</div>", unsafe_allow_html=True)
+st.markdown('<div class="zn-bar"></div>', unsafe_allow_html=True)
 
 missing = [k for k, v in {"AIRTABLE_TOKEN": AIRTABLE_TOKEN, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY}.items() if not v]
 if missing:
@@ -677,6 +877,8 @@ with st.sidebar:
     max_new = st.slider("Max new stories per scan", 20, 150, 60, step=10)
     chosen_beats = st.multiselect("Beats to search", list(BEATS), default=list(BEATS))
     include_trades = st.checkbox("Trade-press sweep", value=True)
+    include_newsletters = st.checkbox("Newsletters", value=True,
+                                      help=", ".join(n["name"] for n in NEWSLETTERS))
     scan_clicked = st.button("🔎 Scan now", type="primary", use_container_width=True)
     st.divider()
     st.caption(f"Drafts go to: **{'Lovable CMS' if lovable_on else 'Stories (Airtable)'}**")
@@ -688,7 +890,7 @@ if scan_clicked:
     bar = st.progress(0.0, text="Starting scan…")
     try:
         res = run_scan(tuple(chosen_beats), days_back, include_trades, max_new,
-                       lambda p, t: bar.progress(min(p, 1.0), text=t))
+                       lambda p, t: bar.progress(min(p, 1.0), text=t), include_newsletters)
         msg = f"Scan done: {res['added']} new on the wire ({res['found']} headlines checked)."
         if res["capped"]:
             msg += f" {res['capped']} more were left for the next scan (raise the max to pull more)."
@@ -787,7 +989,8 @@ with tab_queue:
                         status.warning(f"**{f.get('Headline')}**: couldn't read the article and nothing was "
                                        "pasted, so it stays in the queue. Paste the text and try again.")
                         continue
-                    status.info(f"Drafting **{f.get('Headline')}** as {fmt}…")
+                    status.info(f"Reporting out **{f.get('Headline')}** (finding primary sources, then "
+                                f"writing a {fmt})… this can take a minute.")
                     draft = draft_article(f, fmt, note, source)
 
                     where, link, fell_back = "Lovable", "", None
@@ -800,23 +1003,29 @@ with tab_queue:
                         where, link = "Stories", send_to_stories(draft, fmt, f, note)
 
                     updates = {"Status": "Drafted", "Format": fmt, "Editor's Note": note,
-                               "Draft Link": link or None}
+                               "Draft Link": link or None, "Draft Notes": draft["notes"]}
                     if pasted.strip():
                         updates["Article Text"] = pasted.strip()[:ARTICLE_TEXT_CAP]
                     at_update(WIRE_TABLE, [(rid, updates)])
 
                     line = f"**{draft['headline']}** → {where} · {fmt} · {draft['words']} words"
+                    if draft["researched"]:
+                        line += f" · {draft['searches']} searches"
                     if link:
                         line += f" · [open draft]({link})"
                     if fell_back:
                         status.warning(f"{line}\n\nLovable didn't accept it ({fell_back}), so it went to Stories instead.")
                     elif draft["cut_off"]:
                         status.warning(f"{line}\n\n⚠️ The draft was cut off before the end. Finish it by hand or redraft.")
+                    elif not draft["researched"]:
+                        status.warning(f"{line}\n\n⚠️ Web research wasn't available, so this was written from "
+                                       "the lead only. Check primary sources before publishing.")
                     else:
                         status.success(line)
-                    with st.expander(f"Preview: {draft['headline']}"):
+                    with st.expander(f"Preview and reporting notes: {draft['headline']}"):
                         st.markdown(f"### {draft['headline']}\n\n{draft['body']}")
-                        st.caption(f"Editor flags: {draft['flags']}")
+                        st.divider()
+                        st.markdown(draft["notes"].replace("\n", "  \n"))
                 except Exception as e:
                     status.error(f"Couldn't draft **{f.get('Headline')}**: {e}")
                 bar.progress(i / len(ready))
@@ -836,5 +1045,8 @@ with tab_done:
         f = r["fields"]
         link = f" · [open draft]({f['Draft Link']})" if f.get("Draft Link") else ""
         st.markdown(f"**{f.get('Headline')}** · {f.get('Format', '')}{link}  \n"
-                    f"<span style='opacity:.6;font-size:.85rem'>{esc(f.get('Outlet'))} · {fmt_date(f.get('Published'))}</span>",
+                    f"<span style='opacity:.6;font-size:.85rem'>Lead: {esc(f.get('Outlet'))} · {fmt_date(f.get('Published'))}</span>",
                     unsafe_allow_html=True)
+        if f.get("Draft Notes"):
+            with st.expander("Reporting notes"):
+                st.markdown(f["Draft Notes"].replace("\n", "  \n"))
