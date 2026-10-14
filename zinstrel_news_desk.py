@@ -33,6 +33,36 @@ def get_secret(name, default=""):
         return default
 
 
+# ============================================================
+# PASSWORD GATE
+# The app is publicly reachable on Streamlit Community Cloud, so nothing
+# loads (and no API credits get spent) until the APP_PASSWORD secret is entered.
+# ============================================================
+import hmac
+
+APP_PASSWORD = get_secret("APP_PASSWORD")
+
+
+def _password_ok():
+    if st.session_state.get("authed"):
+        return True
+    st.title("📡 Zinstrel News Desk")
+    if not APP_PASSWORD:
+        st.error("APP_PASSWORD isn't set in this app's secrets, so the desk is locked.")
+        return False
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if hmac.compare_digest(pw, APP_PASSWORD):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    return False
+
+
+if not _password_ok():
+    st.stop()
+
 AIRTABLE_TOKEN = get_secret("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = get_secret("AIRTABLE_BASE_ID", "appOpnIsWZttCgxE6")   # AirMarcus
 AIRTABLE_TABLE = get_secret("AIRTABLE_TABLE", "tblaG75vgdZabVJmj")       # Stories
