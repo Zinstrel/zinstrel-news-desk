@@ -5,3 +5,7 @@ beautifulsoup4>=4.12
 anthropic>=0.40
 googlenewsdecoder==0.2.1
 selectolax>=0.4.12,<1.0   # googlenewsdecoder 0.2.1 breaks on selectolax 1.x
+# Optional Google Analytics / Search Console signals for story ideas
+google-auth>=2.29
+google-analytics-data>=0.18
+google-api-python-client>=2.120

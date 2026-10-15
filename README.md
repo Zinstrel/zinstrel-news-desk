@@ -10,6 +10,27 @@
 
 Unused wire items (New or Skipped) older than 10 days are cleared automatically on each scan, so the base doesn't fill up.
 
+## News only
+Every scanned item must pass a news check before it reaches the Wire. It has to be about AI and music, and it has to report a specific, recent development. Job listings, company and about pages, product and pricing pages, evergreen explainers, tool roundups, and pages whose own publish date is old are dropped. **Re-check the wire** in the sidebar runs the same check over what's already there.
+
+## Story ideas
+The **Ideas** tab suggests stories in Zinstrel's sphere. It draws on everything published on zinstrel.com and Substack (from the site's social feed), the timely stories on the Wire, Google's daily trending searches that touch AI or music, and, when connected, Google Analytics (top pages) and Search Console (the searches that bring readers, plus queries where Zinstrel ranks low). Claude checks for new developments with web search, then pitches each idea with a why-now, a suggested format, a search target, and primary sources to start from. Queue an idea just like a wire story.
+
+Google Trends has no public API, so the desk uses Google's daily trending-searches feed. For keyword-level search data, connect Search Console.
+
+### Connecting Google Analytics and Search Console (optional)
+1. In Google Cloud, create a service account (or reuse one) and create a JSON key for it.
+2. Enable the **Google Analytics Data API** and the **Google Search Console API** for that project.
+3. In GA4, go to Admin → Property access management and add the service account's email as a **Viewer**. Copy the property ID from Admin → Property details.
+4. In Search Console, go to Settings → Users and permissions and add the service account's email (Restricted is enough).
+5. In Streamlit secrets, add `GA4_PROPERTY_ID`, `GSC_SITE_URL` (for example `sc-domain:zinstrel.com`), and a `[gcp_service_account]` block with the JSON key's fields, at the end of the secrets.
+
+## Links per story
+In the Queue, each story has **Links to include**, for up to 5 links. They save as you type. The draft reads each one, draws on it where relevant, and links to it where it supports a point. If a link isn't usable, the editor flags say why. Leave them blank and Claude finds its own sources.
+
+## Summary
+Each draft gets a fresh 1–2 sentence summary. If it repeats the headline or reuses any six-word run from the article, it's rewritten automatically. The summary goes to Lovable's `summary` field and leads the reporting notes.
+
 ## Formats
 - **Major Signal:** about 300 words; the headline doubles as the email subject.
 - **Minor Signal:** a simple header and 2–3 sentences.
